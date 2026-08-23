@@ -22,9 +22,10 @@
 #include <linux/printk.h>
 #include <syscall.h>
 #include <uapi/asm-generic/unistd.h>
+#include <asm-generic/rwonce.h>
 
 KPM_NAME("HMKPM");
-KPM_VERSION("2.4.1");
+KPM_VERSION("2.5.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Yervant7");
 KPM_DESCRIPTION("A KernelPatch Module (KPM) HMKPM");
@@ -32,6 +33,15 @@ KPM_DESCRIPTION("A KernelPatch Module (KPM) HMKPM");
 static bool hook_active = true;
 static bool init_error = false;
 static int mmap_lock_sem_offset = -1;
+static unsigned long fsnotify_addr = 0;
+
+struct inode;
+
+#define PROC_SUPER_MAGIC	0x9fa0
+
+// gki 5.10 to 6.12 same offset
+#define SUPER_BLOCK_OFF 40
+#define MAGIC_OFF 96
 
 struct rw_semaphore;
 extern bool is_su_allow_uid(uid_t uid);
@@ -117,6 +127,57 @@ void kfunc_def(up_read)(struct rw_semaphore *sem);
 
 u64 kvar_def(memstart_addr);
 void *kvar_def(high_memory);
+
+struct inode_min {
+    char pad[SUPER_BLOCK_OFF];
+    void *i_sb;
+};
+
+struct super_block_min {
+    char pad[MAGIC_OFF];
+    unsigned long s_magic;
+};
+
+static inline bool is_proc_inode(const struct inode *inode)
+{
+    const struct inode_min *i = (const struct inode_min *)inode;
+    const struct super_block_min *sb;
+
+    if (!i)
+        return false;
+
+    sb = (const struct super_block_min *)READ_ONCE(i->i_sb);
+    if (!sb)
+        return false;
+
+    return (READ_ONCE(sb->s_magic) == PROC_SUPER_MAGIC);
+}
+
+/*
+int fsnotify(__u32 mask, const void *data, int data_type, struct inode *dir, const struct qstr *file_name, struct inode *inode, u32 cookie)
+*/
+
+static void before_fsnotify(hook_fargs7_t *args, void *udata)
+{
+    struct inode *dir;
+    struct inode *inode;
+    struct inode *target;
+
+    if (!READ_ONCE(hook_active) || !args)
+        return;
+
+    dir   = (struct inode *)args->arg3;
+    inode = (struct inode *)args->arg5;
+    target = inode ? inode : dir;
+
+    if (!target)
+        return;
+
+    if (is_proc_inode(target)) {
+        args->skip_origin = 1;
+        args->ret = 0;
+    }
+}
 
 /* ========================================================================
  * Channel: getresuid, intercepted when arg0 == HMKPM_MAGIC.
@@ -1051,7 +1112,7 @@ static void hmkpm_handle(hook_fargs3_t *args, void *udata)
 	if (likely(!is_hmkpm_magic(magic)))
 		return;
 
-	if (!hook_active)
+	if (!READ_ONCE(hook_active))
 		return;
 
 	uid = current_uid();
@@ -2178,6 +2239,19 @@ static long module_init_handler(const char *args, const char *event, void *__use
 		return -ENOENT;
 	}
 
+    if (kver >= VERSION(5, 10, 0)) {
+        fsnotify_addr = hmkpm_lookup_symbol("fsnotify");
+        if (fsnotify_addr > 0) {
+            err = hook_wrap7((void *)fsnotify_addr, before_fsnotify, 0, 0);
+            if (err) {
+                hmkpm_error("hook installation of fsnotify failed: %d\n", err);
+            }
+        } else {
+            hmkpm_info("fsnotify_addr not found, skipping fsnotify hook\n");
+        }
+    }
+
+
 	err = hook_syscalln(__NR_getresuid, 3, (void *)hmkpm_handle, 0, 0);
 	if (err) {
 		hmkpm_error("install hook error: %d\n", err);
@@ -2238,24 +2312,24 @@ static long module_control_handler(const char *args, char __user *out_msg, int o
 
 	if (kpm_streq(cmd, "enable") || kpm_streq(cmd, "on") ||
 	    kpm_streq(cmd, "start") || kpm_streq(cmd, "1")) {
-		hook_active = true;
+		WRITE_ONCE(hook_active, true);
 		send_user_msg(out_msg, outlen, "enabled\n");
 	} else if (kpm_streq(cmd, "disable") || kpm_streq(cmd, "off") ||
 		   kpm_streq(cmd, "stop") || kpm_streq(cmd, "0")) {
-		hook_active = false;
+		WRITE_ONCE(hook_active, false);
 		send_user_msg(out_msg, outlen, "disabled\n");
 	} else if (kpm_streq(cmd, "status") || kpm_streq(cmd, "state") ||
 		   kpm_streq(cmd, "get")) {
-		if (hook_active)
+		if (READ_ONCE(hook_active))
 			send_user_msg(out_msg, outlen, "active\n");
 		else
 			send_user_msg(out_msg, outlen, "inactive\n");
 	} else if (kpm_streq(cmd, "toggle")) {
-		if (hook_active) {
-			hook_active = false;
+		if (READ_ONCE(hook_active)) {
+			WRITE_ONCE(hook_active, false);
 			send_user_msg(out_msg, outlen, "toggled to disabled\n");
 		} else {
-			hook_active = true;
+			WRITE_ONCE(hook_active, true);
 			send_user_msg(out_msg, outlen, "toggled to enabled\n");
 		}
 	} else {
@@ -2270,6 +2344,9 @@ static long module_control_handler(const char *args, char __user *out_msg, int o
 
 static long module_cleanup_handler(void *__user reserved)
 {
+    if (fsnotify_addr > 0) {
+        hook_unwrap((void *)fsnotify_addr, before_fsnotify, 0);
+    }
 	unhook_syscalln(__NR_getresuid, (void *)hmkpm_handle, 0);
 	hmkpm_info("module cleaned up\n");
 	return 0;
