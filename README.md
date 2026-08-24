@@ -42,7 +42,7 @@ It delivers fast, direct process memory read and write operations by walking har
   - Proper RCU lifecycle management (`rcu_read_lock` / `rcu_read_unlock`) and memory descriptor reference counting (`get_task_mm` / `mmput`).
 
 - **Privilege & Access Control**:
-  - Validates caller permissions against superuser privileges (`is_su_allow_uid(current_uid())`).
+  - Validates caller permissions against superuser privileges.
   - Syscall interception via `__NR_getresuid` using KernelPatch hook infrastructure.
 
 - **Runtime Control Interface**:
