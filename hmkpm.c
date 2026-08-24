@@ -25,7 +25,7 @@
 #include <asm-generic/rwonce.h>
 
 KPM_NAME("HMKPM");
-KPM_VERSION("2.5.0");
+KPM_VERSION("2.5.1");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Yervant7");
 KPM_DESCRIPTION("A KernelPatch Module (KPM) HMKPM");
@@ -44,7 +44,6 @@ struct inode;
 #define MAGIC_OFF 96
 
 struct rw_semaphore;
-extern bool is_su_allow_uid(uid_t uid);
 
 #define U64_MAX				((u64)~0ULL)
 #define HMKPM_TAG			"[HMKPM] "
@@ -1116,7 +1115,7 @@ static void hmkpm_handle(hook_fargs3_t *args, void *udata)
 		return;
 
 	uid = current_uid();
-	if (!is_su_allow_uid(uid))
+	if (uid != 0)
 		return;
 
 	args->skip_origin = 1;
