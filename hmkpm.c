@@ -19,13 +19,14 @@
 #include <linux/errno.h>
 #include <linux/kernel.h>
 #include <linux/mm_types.h>
+#include <linux/sched.h>
 #include <linux/printk.h>
 #include <syscall.h>
 #include <uapi/asm-generic/unistd.h>
 #include <asm-generic/rwonce.h>
 
 KPM_NAME("HMKPM");
-KPM_VERSION("2.5.1");
+KPM_VERSION("2.6.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Yervant7");
 KPM_DESCRIPTION("A KernelPatch Module (KPM) HMKPM");
@@ -112,6 +113,7 @@ do {										\
 void *kfunc_def(memset)(void *s, int c, size_t count);
 unsigned long kfunc_def(__arch_copy_to_user)(void __user *to, const void *from, unsigned long n);
 unsigned long kfunc_def(__arch_copy_from_user)(void *to, const void __user *from, unsigned long n);
+unsigned long kfunc_def(__arch_clear_user)(void __user *to, unsigned long n);
 long kfunc_def(probe_kernel_read)(void *dst, const void *src, size_t size);
 long kfunc_def(probe_kernel_write)(void *dst, const void *src, size_t size);
 long kfunc_def(copy_from_kernel_nofault)(void *dst, const void *src, size_t size);
@@ -315,17 +317,27 @@ static inline uint64_t hmkpm_uaccess_enable(void)
 	if (unlikely(sw_pan_enabled)) {
 		asm volatile("mrs %0, ttbr0_el1" : "=r"(old_ttbr0));
 		struct task_struct *cur = current;
-		if (cur && kf_get_task_mm && kf_mmput) {
-			struct mm_struct *mm = kfunc(get_task_mm)(cur);
-			if (mm) {
+		if (cur) {
+			struct mm_struct *mm = NULL;
+			if (task_struct_offset.active_mm_offset > 0) {
+				hmkpm_copy_from_kernel_nofault(&mm,
+					(const void *)((uintptr_t)cur + task_struct_offset.active_mm_offset),
+					sizeof(mm));
+			} else if (task_struct_offset.mm_offset > 0) {
+				hmkpm_copy_from_kernel_nofault(&mm,
+					(const void *)((uintptr_t)cur + task_struct_offset.mm_offset),
+					sizeof(mm));
+			} else if (kf_get_task_mm) {
+				mm = kfunc(get_task_mm)(cur);
+				if (mm && kf_mmput)
+					kfunc(mmput)(mm);
+			}
+
+			if (mm && mm_struct_offset.pgd_offset >= 0) {
 				uint64_t cur_pgd_va = 0;
-				if (mm_struct_offset.pgd_offset >= 0) {
-					hmkpm_copy_from_kernel_nofault(&cur_pgd_va,
-						(const void *)((uintptr_t)mm + mm_struct_offset.pgd_offset),
-						sizeof(cur_pgd_va));
-				}
-				kfunc(mmput)(mm);
-				if (cur_pgd_va) {
+				if (hmkpm_copy_from_kernel_nofault(&cur_pgd_va,
+					(const void *)((uintptr_t)mm + mm_struct_offset.pgd_offset),
+					sizeof(cur_pgd_va)) == 0 && cur_pgd_va) {
 					uint64_t cur_pgd_pa = pgt_virt_to_phys(cur_pgd_va);
 					asm volatile("msr ttbr0_el1, %0\n isb\n" :: "r"(cur_pgd_pa) : "memory");
 				}
@@ -402,13 +414,10 @@ static inline int validate_phys_range(uint64_t phys, uint64_t size)
 static inline uint64_t pgt_untag_user_va(uint64_t va)
 {
 	/*
-	 * If TBI0 is active, the top byte is ignored.
-	 * This is important for tagged pointers on Android.
+	 * Top Byte Ignore (TBI0 / MTE / HWASan tagged pointers).
+	 * Clears the top 8 bits for safe pointer arithmetic.
 	 */
-	if (pgt_tbi0)
-		va &= 0x00FFFFFFFFFFFFFFULL;
-
-	return va;
+	return va & 0x00FFFFFFFFFFFFFFULL;
 }
 
 static inline uint64_t pgt_desc_to_phys(uint64_t desc)
@@ -431,7 +440,7 @@ static inline bool pgt_block_allowed(int lv)
 		return (lv == 1 || lv == 2);
 }
 
-static uint64_t pgt_pgtable_to_tkpa(uint64_t pgd, uint64_t va)
+static uint64_t pgt_pgtable_to_tkpa(uint64_t pgd, uint64_t va, bool is_write)
 {
 	uint64_t table_va;
 	uint64_t pxd_bits;
@@ -521,6 +530,13 @@ static uint64_t pgt_pgtable_to_tkpa(uint64_t pgd, uint64_t va)
 			if (type != 3ULL)
 				return 0;
 
+			/*
+			 * Bit 7 in ARM64 PTE is PTE_RDONLY (AP[2]).
+			 * Rejects write to Read-Only pages (prevents zero page & COW corruption).
+			 */
+			if (is_write && (desc & (1ULL << 7)))
+				return 0;
+
 			base = pgt_desc_to_phys(desc);
 
 			if (base & (pgt_page_size - 1))
@@ -542,6 +558,12 @@ static uint64_t pgt_pgtable_to_tkpa(uint64_t pgd, uint64_t va)
 			uint64_t base;
 
 			if (!pgt_block_allowed((int)lv))
+				return 0;
+
+			/*
+			 * Bit 7 in ARM64 block descriptor is PTE_RDONLY (AP[2]).
+			 */
+			if (is_write && (desc & (1ULL << 7)))
 				return 0;
 
 			block_bits = (uint64_t)(3 - lv) * pxd_bits + pgt_page_shift;
@@ -567,8 +589,12 @@ static uint64_t pgt_pgtable_to_tkpa(uint64_t pgd, uint64_t va)
 		}
 
 		/*
-		 * Table descriptor.
+		 * Table descriptor:
+		 * Bit 62 is PTATTR_RDONLY (APTable[2]), disallowing writes to subsequent levels.
 		 */
+		if (is_write && (desc & (1ULL << 62)))
+			return 0;
+
 		uint64_t next_pa = pgt_desc_to_phys(desc);
 
 		/*
@@ -737,9 +763,16 @@ static inline void hmkpm_mmap_read_unlock(struct mm_struct *mm)
 	}
 }
 
+#define HMKPM_BOUNCE_SIZE 512U
+
 static void hmkpm_zero_user(void __user *dst, size_t size)
 {
-	static const uint8_t zero_chunk[128] = {0};
+	static const uint8_t zero_chunk[256] = {0};
+
+	if (kf___arch_clear_user) {
+		kfunc(__arch_clear_user)(dst, size);
+		return;
+	}
 
 	while (size > 0) {
 		size_t chunk = min(size, sizeof(zero_chunk));
@@ -751,10 +784,12 @@ static void hmkpm_zero_user(void __user *dst, size_t size)
 	}
 }
 
-static ssize_t pgt_rw_mm(struct mm_struct *mm, uint64_t remote_va, size_t len, void __user *local_buf, bool is_write)
+static ssize_t pgt_rw_mm(struct mm_struct *mm, uint64_t remote_va, size_t len,
+			 void __user *local_buf, bool is_write)
 {
 	ssize_t total = 0;
 	uint64_t pgd = 0;
+	uint8_t bounce[HMKPM_BOUNCE_SIZE];
 
 	if (!mm)
 		return -ESRCH;
@@ -762,47 +797,72 @@ static ssize_t pgt_rw_mm(struct mm_struct *mm, uint64_t remote_va, size_t len, v
 	if (mm_struct_offset.pgd_offset < 0)
 		return -EINVAL;
 
+	/* In lockless mode, disallow writes to prevent Use-After-Free / corruption */
+	if (is_write && mmap_lock_sem_offset < 0)
+		return -EOPNOTSUPP;
+
 	if (hmkpm_copy_from_kernel_nofault(&pgd,
 					   (const void *)((uintptr_t)mm + mm_struct_offset.pgd_offset),
 					   sizeof(pgd)) != 0 || !pgd)
 		return -EFAULT;
 
-	/* Page-by-page read/write loop */
+	/* Page-by-page read/write loop with stack-safe bounce buffer */
 	while (len > 0) {
-		uint64_t tkpa = pgt_pgtable_to_tkpa(pgd, remote_va);
-		unsigned long page_off;
-		size_t chunk;
-		void *tkva;
-		unsigned long not_copied;
-		unsigned long copied;
+		unsigned long page_off = remote_va & (pgt_page_size - 1);
+		size_t page_left = (size_t)(pgt_page_size - page_off);
+		size_t chunk = min(len, page_left);
+		chunk = min(chunk, (size_t)HMKPM_BOUNCE_SIZE);
 
+		if (is_write) {
+			/* Copy from caller userspace into bounce buffer outside target lock */
+			unsigned long not_copied = hmkpm_copy_from_user(bounce, local_buf, chunk);
+			if (not_copied) {
+				if (not_copied == chunk) {
+					if (total > 0)
+						break;
+					return -EFAULT;
+				}
+				chunk -= not_copied;
+			}
+		}
+
+		/* Lock target mm for page table resolution and in-kernel copy */
+		hmkpm_mmap_read_lock(mm);
+
+		uint64_t tkpa = pgt_pgtable_to_tkpa(pgd, remote_va, is_write);
 		if (!tkpa) {
+			hmkpm_mmap_read_unlock(mm);
 			if (total > 0)
-				break; /* partial read/write is OK */
+				break;
 			return -EFAULT;
 		}
 
-		page_off = remote_va & (pgt_page_size - 1);
-		chunk = min(len, (size_t)(pgt_page_size - page_off));
-		tkva = (void *)pgt_phys_to_virt(tkpa);
+		void *tkva = (void *)pgt_phys_to_virt(tkpa);
 
-		if (!is_write) {
-			/* hmkpm_copy_to_user returns number of bytes NOT copied (0=success) */
-			not_copied = hmkpm_copy_to_user(local_buf, tkva, chunk);
+		if (is_write) {
+			for (size_t i = 0; i < chunk; i++)
+				((uint8_t *)tkva)[i] = bounce[i];
 		} else {
-			/* hmkpm_copy_from_user returns number of bytes NOT copied (0=success) */
-			not_copied = hmkpm_copy_from_user(tkva, local_buf, chunk);
+			for (size_t i = 0; i < chunk; i++)
+				bounce[i] = ((const uint8_t *)tkva)[i];
 		}
 
-		copied = chunk - not_copied;
-		total += (ssize_t)copied;
+		hmkpm_mmap_read_unlock(mm);
 
-		if (not_copied)
-			break; /* couldn't copy everything — stop */
+		if (!is_write) {
+			/* Copy from bounce buffer to caller userspace outside target lock */
+			unsigned long not_copied = hmkpm_copy_to_user(local_buf, bounce, chunk);
+			if (not_copied) {
+				size_t copied = chunk - not_copied;
+				total += (ssize_t)copied;
+				break;
+			}
+		}
 
-		local_buf = (void __user *)((uintptr_t)local_buf + copied);
-		remote_va += copied;
-		len -= copied;
+		total += (ssize_t)chunk;
+		local_buf = (void __user *)((uintptr_t)local_buf + chunk);
+		remote_va += chunk;
+		len -= chunk;
 	}
 
 	return total;
@@ -833,9 +893,7 @@ static ssize_t pgt_rw(pid_t pid, uint64_t remote_va, size_t len,
 	if (!mm)
 		return -ESRCH;
 
-	hmkpm_mmap_read_lock(mm);
 	ret = pgt_rw_mm(mm, remote_va, len, local_buf, is_write);
-	hmkpm_mmap_read_unlock(mm);
 
 	kfunc(mmput)(mm);
 	return ret;
@@ -880,6 +938,8 @@ static void hmkpm_handle_single(hook_fargs3_t *args, void __user *user_ptr, uint
 		args->ret = (uint64_t)(long)-EINVAL;
 		return;
 	}
+
+	req.addr = pgt_untag_user_va(req.addr);
 
 	if (req.addr > U64_MAX - (uint64_t)req.size) {
 		args->ret = (uint64_t)(long)-EINVAL;
@@ -999,9 +1059,6 @@ static void hmkpm_handle_batch(hook_fargs3_t *args, void __user *user_ptr, uint6
 		goto out;
 	}
 
-	/* Lock the mm for the entire batch of operations for page table stability */
-	hmkpm_mmap_read_lock(mm);
-
 	data_start = entries_end;
 
 	while (done < hdr.count) {
@@ -1042,6 +1099,8 @@ static void hmkpm_handle_batch(hook_fargs3_t *args, void __user *user_ptr, uint6
 				rc = -EINVAL;
 				goto out_mm;
 			}
+
+			e->addr = pgt_untag_user_va(e->addr);
 
 			if (e->addr > U64_MAX - req_size) {
 				e->size = 0;
@@ -1092,7 +1151,6 @@ static void hmkpm_handle_batch(hook_fargs3_t *args, void __user *user_ptr, uint6
 
 out_mm:
 	if (mm) {
-		hmkpm_mmap_read_unlock(mm);
 		kfunc(mmput)(mm);
 		mm = NULL;
 	}
@@ -2180,6 +2238,15 @@ static long module_init_handler(const char *args, const char *event, void *__use
 		hmkpm_error("Failed to find kfunc __arch_copy_from_user / __copy_from_user\n");
 		init_error = true;
 	}
+
+	kf___arch_clear_user =
+		(typeof(kf___arch_clear_user))hmkpm_lookup_symbol("__arch_clear_user");
+	if (!kf___arch_clear_user)
+		kf___arch_clear_user =
+			(typeof(kf___arch_clear_user))hmkpm_lookup_symbol("__clear_user");
+	if (!kf___arch_clear_user)
+		kf___arch_clear_user =
+			(typeof(kf___arch_clear_user))hmkpm_lookup_symbol("clear_user");
 
 	hkfunc_match(find_task_by_vpid);
 	hkfunc_match(get_task_mm);
